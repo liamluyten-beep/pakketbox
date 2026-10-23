@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pakketbox bediening</title>
+<style>
+  :root {
+    --bg: #f3f5f4; --paneel: #ffffff; --tekst: #1b2421; --zacht: #5d6b66;
+    --rand: #d5dcd9; --open: #1f7a4d; --dicht: #a63a2b; --accent: #23415a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151a18; --paneel: #1f2623; --tekst: #e8eeeb; --zacht: #9aa9a3;
+      --rand: #33403b; --open: #4cc38a; --dicht: #e8806f; --accent: #8fb4d4;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px; background: var(--bg); color: var(--tekst);
+    font-family: "Segoe UI", system-ui, sans-serif; line-height: 1.4;
+  }
+  main { max-width: 440px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { color: var(--zacht); margin: 0 0 20px; font-size: .95rem; }
+  .paneel {
+    background: var(--paneel); border: 1px solid var(--rand);
+    border-radius: 10px; padding: 16px; margin-bottom: 14px;
+  }
+  .rij { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .label { color: var(--zacht); font-size: .85rem; margin-bottom: 4px; }
+  #verbinding { font-weight: 600; }
+  #status { font-size: 1.6rem; font-weight: 700; min-height: 2.2rem; }
+  #status.open { color: var(--open); }
+  #status.dicht { color: var(--dicht); }
+  button {
+    font: inherit; font-weight: 600; border: 0; border-radius: 8px;
+    padding: 14px 16px; cursor: pointer; color: #fff; width: 100%;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  #btnVerbind { background: var(--accent); }
+  #btnOpen { background: #1f7a4d; }
+  #btnDicht { background: #a63a2b; }
+  .knoppen { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  #log {
+    font-family: Consolas, monospace; font-size: .8rem; color: var(--zacht);
+    max-height: 160px; overflow-y: auto; white-space: pre-wrap; margin: 0;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pakketbox</h1>
+  <p class="sub">Bediening via Bluetooth Low Energy</p>
+
+  <div class="paneel">
+    <div class="rij">
+      <div>
+        <div class="label">Verbinding</div>
+        <div id="verbinding">Niet verbonden</div>
+      </div>
+      <div style="width:150px"><button id="btnVerbind">Verbinden</button></div>
+    </div>
+  </div>
+
+  <div class="paneel">
+    <div class="label">Status van de box</div>
+    <div id="status">--</div>
+  </div>
+
+  <div class="paneel">
+    <div class="knoppen">
+      <button id="btnOpen" disabled>Open</button>
+      <button id="btnDicht" disabled>Dicht</button>
+    </div>
+  </div>
+
+  <div class="paneel">
+    <div class="label">Logboek</div>
+    <pre id="log"></pre>
+  </div>
+</main>
+
+<script>
+// ============================================================
+// Web Bluetooth client voor de ESP32 pakketbox
+// Documentatie: https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API
+// De UUID's moeten 100% overeenkomen met config.h op de ESP32.
+// ============================================================
+const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const CMD_UUID     = 'beb5483e-36e1-4688-b7f5-ea07361b26a8'; // gsm -> ESP32 (Write)
+const STATUS_UUID  = 'beb5483e-36e1-4688-b7f5-ea07361b26a9'; // ESP32 -> gsm (Notify)
+
+const CMD_OPEN  = '1';
+const CMD_DICHT = '0';
+
+let bleDevice = null;
+let cmdChar = null;
+let statusChar = null;
+
+const elVerbinding = document.getElementById('verbinding');
+const elStatus = document.getElementById('status');
+const elLog = document.getElementById('log');
+const btnVerbind = document.getElementById('btnVerbind');
+const btnOpen = document.getElementById('btnOpen');
+const btnDicht = document.getElementById('btnDicht');
+
+// Logboek onderaan de pagina
+function log(tekst) {
+  const tijd = new Date().toLocaleTimeString('nl-BE');
+  elLog.textContent += tijd + '  ' + tekst + '\n';
+  elLog.scrollTop = elLog.scrollHeight;
+}
+
+// Knoppen en tekst aanpassen aan de verbindingstoestand
+function zetVerbonden(verbonden) {
+  elVerbinding.textContent = verbonden ? 'Verbonden met ' + bleDevice.name : 'Niet verbonden';
+  btnOpen.disabled = !verbonden;
+  btnDicht.disabled = !verbonden;
+  btnVerbind.textContent = verbonden ? 'Loskoppelen' : 'Verbinden';
+}
+
+// ESP32 -> gsm: wordt aangeroepen bij elke notify() van de ESP32
+function handleStatus(event) {
+  const tekst = new TextDecoder().decode(event.target.value);
+  elStatus.textContent = tekst;
+  elStatus.className = tekst.toLowerCase().includes('open') ? 'open' : 'dicht';
+  log('Status ontvangen: ' + tekst);
+}
+
+// Stap 1-4: scannen, verbinden, service en characteristics ophalen
+async function verbind() {
+  try {
+    log('Zoeken naar apparaten...');
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID]
+    });
+    bleDevice.addEventListener('gattserverdisconnected', () => {
+      log('Verbinding verbroken');
+      zetVerbonden(false);
+    });
+
+    const server = await bleDevice.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    cmdChar = await service.getCharacteristic(CMD_UUID);
+    statusChar = await service.getCharacteristic(STATUS_UUID);
+
+    // Abonneren op notificaties (zet de CCCD-descriptor op de ESP32 aan)
+    await statusChar.startNotifications();
+    statusChar.addEventListener('characteristicvaluechanged', handleStatus);
+
+    zetVerbonden(true);
+    log('Verbonden met ' + bleDevice.name);
+
+    // Huidige status eenmalig lezen
+    const waarde = await statusChar.readValue();
+    handleStatus({ target: { value: waarde } });
+  } catch (fout) {
+    log('Fout: ' + fout.message);
+    zetVerbonden(false);
+  }
+}
+
+function koppelLos() {
+  if (bleDevice && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
+}
+
+// gsm -> ESP32: schrijft '1' of '0' naar de Write-characteristic
+async function stuurCommando(cmd) {
+  if (!cmdChar) return;
+  try {
+    await cmdChar.writeValue(new TextEncoder().encode(cmd));
+    log('Commando verstuurd: ' + cmd);
+  } catch (fout) {
+    log('Versturen mislukt: ' + fout.message);
+  }
+}
+
+btnVerbind.addEventListener('click', () => {
+  if (bleDevice && bleDevice.gatt.connected) koppelLos(); else verbind();
+});
+btnOpen.addEventListener('click', () => stuurCommando(CMD_OPEN));
+btnDicht.addEventListener('click', () => stuurCommando(CMD_DICHT));
+
+if (!navigator.bluetooth) {
+  log('Web Bluetooth niet ondersteund. Gebruik Chrome op Android of pc.');
+  btnVerbind.disabled = true;
+}
+</script>
+</body>
+</html>
